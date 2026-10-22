@@ -13,7 +13,7 @@ I've put together a community integration that automatically toggles KDE Plasma'
 - Strict ownership rules: never clears a user-initiated DND, respects manual toggles, guards against composite inhibition sources.
 - Handles KDE's quirks (manual DND flag vs composite inhibition, timestamp format).
 
-**Repository (community-maintained):** [link will be added once published]
+**Repository (community-maintained):** https://github.com/KhalidHayKay/focus-timer-kde-dnd
 
 **Notes:**
 - This is community-maintained and not officially endorsed.
