@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+#
+# focus-dnd-off - disable KDE Plasma "Do Not Disturb" (manual DND), idempotently.
+#
+# Safety rules:
+#   * Only DND that this automation enabled (see focus-dnd-on) is turned off.
+#     A pre-existing, user-owned DND is never cleared.
+#   * The decision is based on the manual DND flag, never on the composite
+#     "Inhibited" property (that property is an OR of several sources).
+#   * Turning DND off via the shortcut revokes *all* inhibition requests
+#     registered by applications (Plasma's revokeInhibitions()), so it is
+#     performed only when this automation owns the DND it is about to clear.
+#     That collateral effect is disclosed in the log (policy P3).
+#
+# Exit codes: 0 = done or intentionally refused, 1 = failure.
+#
+set -uo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/plasmanotifyrc"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/focus-dnd"
+STATE_FILE="$STATE_DIR/owner"
+LOG_FILE="$STATE_DIR/focus-dnd.log"
+LOCK_FILE="$STATE_DIR/lock"
+STALE_SECONDS=86400
+
+log() { printf '%s focus-dnd-off: %s\n' "$(date --iso-8601=seconds)" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+emit() { printf '%s\n' "$*"; }
+die() { log "FAIL: $*"; emit "failed: $*"; exit 1; }
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+exec 9>>"$LOCK_FILE" 2>/dev/null || true
+flock -w 15 9 2>/dev/null || true
+
+state_get() { [ -f "$STATE_FILE" ] || return 0; awk -F= -v k="$1" '$1==k{print $2; exit}' "$STATE_FILE" 2>/dev/null; }
+
+save_state() {   # pre owned
+    local pre="$1" owned="$2" acq bus name
+    acq=$(state_get acquired)
+    bus=$(state_get owner-bus)
+    name=$(state_get owner-name)
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    {
+        printf 'pre=%s\n' "$pre"
+        printf 'owned=%s\n' "$owned"
+        if [ -n "$acq" ]; then printf 'acquired=%s\n' "$acq"; fi
+        if [ -n "$bus" ]; then printf 'owner-bus=%s\n' "$bus"; fi
+        if [ -n "$name" ]; then printf 'owner-name=%s\n' "$name"; fi
+        return 0
+    } >"$STATE_FILE" 2>/dev/null
+}
+
+# Drop the record unless it still carries something we must remember:
+# the automation's ownership, or the user's own DND that we must not re-assert.
+state_prune() {  # manual_state
+    local m="$1" pre owned
+    pre=$(state_get pre)
+    owned=$(state_get owned)
+    [ "$owned" = "yes" ] && return 0
+    if [ "$pre" = "manual-on" ] && [ "$m" = "on" ]; then return 0; fi
+    rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+state_is_stale() {
+    [ -f "$STATE_FILE" ] || return 1
+    local now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$STATE_FILE" 2>/dev/null) || return 1
+    [ $((now - mtime)) -gt "$STALE_SECONDS" ]
+}
+
+load_state() {
+    pre=$(state_get pre)
+    owned=$(state_get owned)
+    if [ "$owned" != "yes" ] && state_is_stale; then
+        log "the state record is older than ${STALE_SECONDS}s and owns nothing - discarding it"
+        rm -f "$STATE_FILE" 2>/dev/null || true
+        pre=""
+        owned=""
+    fi
+}
+
+# manual DND flag: on | off | unknown
+manual_state() {
+    local until iso until_s now
+    [ -r "$CONFIG" ] || { echo unknown; return; }
+    until=$(awk '/^\[DoNotDisturb\]/{f=1;next} /^\[/{f=0} f && /^Until[[:space:]]*=/{sub(/^Until[[:space:]]*=/,""); print; exit}' "$CONFIG")
+    [ -n "$until" ] || { echo off; return; }
+    case "$until" in @*) echo off; return;; esac
+    # Plasma writes the seconds field without a leading zero (e.g. "16,59,0.101"),
+    # so every field is accepted with 1-2 digits and re-padded here.
+    iso=$(printf '%s' "$until" | awk -F, '
+      function ok(x, maxlen) { return x ~ /^[0-9]+$/ && length(x) <= maxlen }
+      NF >= 6 {
+        y=$1; mo=$2; d=$3; h=$4; mi=$5; s=$6; frac="";
+        p=index(s, ".");
+        if (p > 0) { frac=substr(s, p); s=substr(s, 1, p-1) }
+        else if (NF >= 7) { frac="." $7 }
+        if (!ok(y,4)||!ok(mo,2)||!ok(d,2)||!ok(h,2)||!ok(mi,2)||!ok(s,2)) exit 1;
+        if (frac != "" && frac !~ /^\.[0-9]+$/) exit 1;
+        printf "%04d-%02d-%02d %02d:%02d:%02d%s", y+0, mo+0, d+0, h+0, mi+0, s+0, frac;
+      }')
+    [ -n "$iso" ] || { echo unknown; return; }
+    until_s=$(date -d "$iso" +%s 2>/dev/null) || { echo unknown; return; }
+    now=$(date +%s)
+    if [ "$until_s" -gt "$now" ]; then echo on; else echo off; fi
+}
+
+toggle() {
+    qdbus6 org.kde.kglobalaccel /component/plasmashell \
+        invokeShortcut "toggle do not disturb" >/dev/null 2>&1
+}
+
+load_state
+m=$(manual_state)
+log "start manual=$m pre=${pre:-none} owned=${owned:-none}"
+
+if [ "$m" = "off" ]; then
+    if [ "$owned" = "yes" ]; then
+        save_state manual-off no || true
+        log "already disabled - ownership released"
+        emit "already disabled - ownership released"
+    else
+        log "already disabled - no action"
+        emit "already disabled - no action"
+    fi
+    state_prune "$m"
+    exit 0
+fi
+
+if [ "$owned" != "yes" ]; then
+    # The DND was not enabled by this automation (e.g. it was already on
+    # before the session started). Clearing it would remove the user's own
+    # DND - leave it enabled.
+    #
+    # The ownership is checked *before* the manual flag is required, so that
+    # an unreadable flag cannot turn this no-op into a failure.
+    if [ "$m" = "unknown" ]; then
+        log "nothing to restore: DND is not owned by this automation (pre=${pre:-none}) - manual flag unreadable, no action taken"
+        emit "nothing to restore: DND is not owned by this automation - manual flag unreadable, no action taken"
+    else
+        log "nothing to restore: DND is not owned by this automation (pre=${pre:-none}) - leaving it enabled"
+        emit "nothing to restore: DND is not owned by this automation - leaving it enabled"
+    fi
+    exit 0
+fi
+
+if [ "$m" = "unknown" ]; then
+    die "cannot read the manual DND flag from $CONFIG - refusing to toggle"
+fi
+
+toggle || die "failed to invoke the 'toggle do not disturb' shortcut"
+
+sleep 0.4
+m2=$(manual_state)
+[ "$m2" = "off" ] || { sleep 1.0; m2=$(manual_state); }
+if [ "$m2" != "off" ]; then
+    die "DND is still enabled (manual=$m2) - not retrying"
+fi
+
+save_state manual-off no || die "cannot write $STATE_FILE"
+state_prune "$m"
+log "disabled and released ownership"
+log "DISCLOSURE: Plasma's DND-off path (revokeInhibitions) also cleared any application-level suppression requests that were registered while DND was on"
+emit "disabled and released ownership"
+exit 0

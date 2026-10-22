@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""focus-dnd-service - drive KDE Plasma's "Do Not Disturb" from Focus Timer.
+
+Option A': this host-side service *observes* Focus Timer's D-Bus API on the
+session bus.  It never asks the application to run anything and the
+application needs no extra Flatpak permissions.
+
+Actuation is delegated to the focus-dnd-on / focus-dnd-off helper scripts,
+which own the DND ownership rules:
+
+  * the decision is made on the *manual* DND flag
+    ([DoNotDisturb] Until in ~/.config/plasmanotifyrc), never on the
+    composite "Inhibited" property,
+  * a DND that this automation did not enable is never cleared,
+  * a DND that the user turned on before the session is never touched.
+
+D-Bus contract
+    bus name   io.github.haykay.FocusDND
+    object     /io/github/haykay/FocusDND
+    interface  io.github.haykay.FocusDND
+        GetState() -> (s manual, s composite, s ownership, s pre,
+                       s work, s session, s app)
+        SetDnd(b desired) -> (s outcome)
+"""
+
+import errno
+import fcntl
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+from gi.repository import Gio, GLib
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+APP_BUS_NAME = "io.github.focustimerhq.FocusTimer"
+APP_OBJECT_PATH = "/io/github/focustimerhq/FocusTimer"
+APP_IFACE_TIMER = "io.github.focustimerhq.FocusTimer.Timer"
+APP_IFACE_SESSION = "io.github.focustimerhq.FocusTimer.Session"
+
+SERVICE_BUS_NAME = "io.github.haykay.FocusDND"
+SERVICE_OBJECT_PATH = "/io/github/haykay/FocusDND"
+SERVICE_IFACE = "io.github.haykay.FocusDND"
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+
+CONFIG_FILE = os.path.join(XDG_CONFIG_HOME, "plasmanotifyrc")
+STATE_DIR = os.path.join(XDG_STATE_HOME, "focus-dnd")
+STATE_FILE = os.path.join(STATE_DIR, "owner")
+LOCK_FILE = os.path.join(STATE_DIR, "lock")
+LOG_FILE = os.path.join(STATE_DIR, "focus-dnd.log")
+
+BIN_DIR = os.path.join(HOME, ".local", "bin")
+SCRIPT_ON = os.path.join(BIN_DIR, "focus-dnd-on")
+SCRIPT_OFF = os.path.join(BIN_DIR, "focus-dnd-off")
+
+POLL_INTERVAL_S = 5
+SCRIPT_GUARD_S = 3.0          # ignore external changes right after our own call
+STALE_SECONDS = 86400         # a record that owns nothing expires after a day
+
+NODE_INFO = """
+<node>
+  <interface name="io.github.haykay.FocusDND">
+    <method name="GetState">
+      <arg type="s" name="manual" direction="out"/>
+      <arg type="s" name="composite" direction="out"/>
+      <arg type="s" name="ownership" direction="out"/>
+      <arg type="s" name="pre_state" direction="out"/>
+      <arg type="s" name="work_active" direction="out"/>
+      <arg type="s" name="session_state" direction="out"/>
+      <arg type="s" name="app" direction="out"/>
+    </method>
+    <method name="SetDnd">
+      <arg type="b" name="desired" direction="in"/>
+      <arg type="s" name="outcome" direction="out"/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def log(message):
+    """Append a timestamped line to the shared log file."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write("%s focus-dnd-service: %s\n" % (stamp, message))
+    except OSError:
+        pass
+
+
+def read_state():
+    """Read the shared ownership record."""
+    fields = {}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                fields[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return fields
+
+
+def write_state(fields):
+    """Update the shared ownership record (read-modify-write, atomic swap)."""
+    current = read_state()
+    current.update(fields)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            for key, value in current.items():
+                handle.write("%s=%s\n" % (key, value))
+        os.replace(tmp, STATE_FILE)
+    except OSError as error:
+        log("cannot write %s: %s" % (STATE_FILE, error))
+        return False
+    return True
+
+
+def remove_state():
+    try:
+        os.unlink(STATE_FILE)
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            log("cannot remove %s: %s" % (STATE_FILE, error))
+
+
+class StateLock:
+    """Serialise the helper scripts and this service against each other."""
+
+    def __init__(self):
+        self.handle = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            self.handle = open(LOCK_FILE, "a+")
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            self.handle = None
+        return self
+
+    def __exit__(self, *_exc):
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+                self.handle.close()
+            except OSError:
+                pass
+            self.handle = None
+        return False
+
+
+def variant_value(reply):
+    """Return the payload of a "(v)" reply as a plain Python value."""
+    value = reply.unpack()[0]
+    if isinstance(value, GLib.Variant):
+        value = value.unpack()
+    return value
+
+
+def manual_dnd_state():
+    """Return "on", "off" or "unknown" for Plasma's *manual* DND flag.
+
+    The manual flag is the [DoNotDisturb] Until entry of plasmanotifyrc.
+    An empty or invalid value means "off"; a timestamp in the future means
+    "on".
+    """
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as handle:
+            in_group = False
+            for line in handle:
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_group = line == "[DoNotDisturb]"
+                    continue
+                if not in_group or not line.startswith("Until"):
+                    continue
+                _, _, raw = line.partition("=")
+                raw = raw.strip()
+                if not raw or raw.startswith("@"):
+                    return "off"
+                parts = raw.split(",")
+                if len(parts) < 6:
+                    return "unknown"
+                try:
+                    year, month, day, hour, minute = (int(p) for p in parts[:5])
+                    second = int(float(parts[5]))
+                except ValueError:
+                    return "unknown"
+                micro = 0
+                if len(parts) > 6 and "." in parts[6]:
+                    try:
+                        micro = int(round(float("0." + parts[6].split(".")[1]) * 1e6))
+                    except ValueError:
+                        micro = 0
+                try:
+                    until = datetime(year, month, day, hour, minute, second, micro,
+                                     tzinfo=datetime.now().astimezone().tzinfo)
+                except ValueError:
+                    return "unknown"
+                return "on" if until.timestamp() > time.time() else "off"
+    except OSError:
+        return "unknown"
+    return "off"
+
+
+def composite_dnd_state(connection):
+    """Return "on", "off" or "unknown" for the composite DND property.
+
+    This is an OR of the manual flag, application inhibition requests and the
+    fullscreen/mirrored rules, so it must not be used for ownership decisions.
+    """
+    try:
+        reply = connection.call_sync(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant("(ss)", ("org.freedesktop.Notifications", "Inhibited")),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+    except GLib.Error as error:
+        log("cannot read the composite DND state: %s" % error.message)
+        return "unknown"
+    value = variant_value(reply)
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return "unknown"
+
+
+# --------------------------------------------------------------------------
+# the service
+# --------------------------------------------------------------------------
+
+class FocusDndService:
+
+    def __init__(self):
+        self.connection = None
+        self.loop = GLib.MainLoop()
+        self.own_id = 0
+        self.node_info = Gio.DBusNodeInfo.new_for_xml(NODE_INFO)
+        self.work_active = False
+        self.session_active = False
+        self.session_state = "stopped"
+        self.app_running = False
+        self.last_script_call = 0.0
+        self.poll_source = None
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def run(self):
+        self.connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.own_id = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            SERVICE_BUS_NAME,
+            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            self.on_bus_acquired,
+            self.on_name_acquired,
+            self.on_name_lost,
+        )
+        self.loop.run()
+
+    def on_bus_acquired(self, connection, _name):
+        connection.register_object(
+            SERVICE_OBJECT_PATH,
+            self.node_info.interfaces[0],
+            self.on_method_call,
+            None,
+            None,
+        )
+
+    def on_name_acquired(self, _connection, _name):
+        log("started, bus name %s acquired" % SERVICE_BUS_NAME)
+        self.subscribe_app_signals()
+        self.poll_source = GLib.timeout_add_seconds(POLL_INTERVAL_S, self.on_poll)
+        self.recover()
+        self.evaluate("startup")
+
+    def on_name_lost(self, _connection, _name):
+        # Either another instance owns the name (duplicate protection) or the
+        # session bus went away. Either way this process must not act.
+        log("lost the bus name %s - exiting" % SERVICE_BUS_NAME)
+        if self.poll_source is not None:
+            GLib.source_remove(self.poll_source)
+            self.poll_source = None
+        self.loop.quit()
+
+    # -- observing the application ----------------------------------------
+
+    def subscribe_app_signals(self):
+        # Gio keeps the subscription in sync with the owner of the well-known
+        # name, so the observer follows the application across restarts.
+        # Subscribing never activates the application.
+        self.connection.signal_subscribe(
+            APP_BUS_NAME,      # sender
+            None,              # interface
+            None,              # member
+            APP_OBJECT_PATH,   # object path
+            None,              # arg0
+            0,                 # flags
+            self.on_app_signal,
+            None,              # user data
+        )
+
+    def on_app_signal(self, _conn, _sender, _path, _iface, member, _params, _user):
+        if member == "tick":
+            return
+        log("signal from focus timer: %s" % member)
+        self.evaluate("signal %s" % member)
+
+    def app_present(self):
+        """True when Focus Timer currently owns its bus name (no activation)."""
+        try:
+            reply = self.connection.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", (APP_BUS_NAME,)),
+                GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+        except GLib.Error:
+            return False
+        return bool(reply.unpack()[0])
+
+    def query_app(self):
+        """Return the application state or None when it is not running."""
+        if not self.app_present():
+            return None
+        try:
+            reply = self.connection.call_sync(
+                APP_BUS_NAME,
+                APP_OBJECT_PATH,
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                GLib.Variant("(ss)", (APP_IFACE_SESSION, "CurrentState")),
+                GLib.VariantType("(v)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            session_state = str(variant_value(reply))
+        except GLib.Error as error:
+            log("cannot read the session state: %s" % error.message)
+            return None
+        try:
+            reply = self.connection.call_sync(
+                APP_BUS_NAME,
+                APP_OBJECT_PATH,
+                APP_IFACE_TIMER,
+                "IsRunning",
+                None,
+                GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                None,
+            )
+            running = bool(reply.unpack()[0])
+        except GLib.Error as error:
+            log("cannot read the timer state: %s" % error.message)
+            return None
+        # A pomodoro is "work" only while the timer really runs: the session
+        # state alone also reads "pomodoro" for a scheduled or paused block.
+        work = session_state == "pomodoro" and running
+        return {
+            "session_state": session_state,
+            "running": running,
+            "work": work,
+        }
+
+    # -- the state machine -------------------------------------------------
+
+    def evaluate(self, reason):
+        # NB: the state lock is never held while a helper script runs - the
+        # scripts take the same lock themselves, so holding it here would
+        # make them wait for us.
+        state = self.query_app()
+        if state is None:
+            if self.app_running:
+                log("focus timer is not running anymore")
+            self.app_running = False
+            self.session_state = "stopped"
+            if self.work_active:
+                self.work_active = False
+                self.on_work_end("focus timer is not running")
+            if self.session_active:
+                self.session_active = False
+                self.on_session_end()
+            return
+
+        if not self.app_running:
+            log("focus timer is running (session state: %s)" % state["session_state"])
+        self.app_running = True
+        self.session_state = state["session_state"]
+
+        work = state["work"]
+        session_active = state["session_state"] not in ("stopped", "unknown")
+
+        if work and not self.work_active:
+            self.work_active = True
+            self.on_work_start(reason)
+        elif not work and self.work_active:
+            self.work_active = False
+            self.on_work_end(reason)
+
+        if session_active and not self.session_active:
+            self.session_active = True
+        elif not session_active and self.session_active:
+            self.session_active = False
+            self.on_session_end()
+        elif not session_active:
+            # No session is running: a leftover record that owns nothing is
+            # stale (it can only come from a manual SetDnd call or from a
+            # crashed session) and would otherwise block the next session.
+            self.drop_stale_record()
+
+    def drop_stale_record(self):
+        record = read_state()
+        if not record or record.get("owned") == "yes":
+            return
+        remove_state()
+
+    def on_work_start(self, reason):
+        """The user started a pomodoro: enable the DND if we may."""
+        log("work started (%s)" % reason)
+        with StateLock():
+            record = read_state()
+            if not record.get("pre"):
+                # Snapshot the manual DND state *before* the automation touches it.
+                manual = manual_dnd_state()
+                if manual == "unknown":
+                    log("cannot read the manual DND flag - refusing to enable the DND")
+                    return
+                fields = {"pre": "manual-on" if manual == "on" else "manual-off"}
+                if "owned" not in record:
+                    fields["owned"] = "no"
+                write_state(fields)
+                log("session snapshot: pre=%s" % fields["pre"])
+        self.run_script(SCRIPT_ON, "enable")
+
+    def on_work_end(self, reason):
+        """The work period is over: restore the previous DND state."""
+        log("work ended (%s)" % reason)
+        self.run_script(SCRIPT_OFF, "restore")
+
+    def on_session_end(self):
+        """The session is over: release the session level snapshot."""
+        log("session ended")
+        with StateLock():
+            record = read_state()
+            if record.get("owned") == "yes":
+                log("the DND is still owned - keeping the record until it is restored")
+                return
+            if record:
+                remove_state()
+
+    def recover(self):
+        """After a crash or a restart: re-establish a consistent state."""
+        record = read_state()
+        if record.get("owned") != "yes":
+            return
+        log("recovery: the record says the DND is owned by this automation")
+        state = self.query_app()
+        if state is not None and state["work"]:
+            self.work_active = True
+            self.session_active = state["session_state"] not in ("stopped", "unknown")
+            log("  focus timer runs a pomodoro - keeping the DND enabled")
+            return
+        log("  focus timer does not run a pomodoro - restoring the previous DND state")
+        self.run_script(SCRIPT_OFF, "restore")
+
+    # -- actuation ---------------------------------------------------------
+
+    def run_script(self, path, what):
+        """Run one of the helper scripts and report the outcome."""
+        if not os.path.exists(path):
+            log("%s: %s is missing" % (what, path))
+            return "failed: %s is missing" % os.path.basename(path)
+        self.last_script_call = time.monotonic()
+        try:
+            proc = subprocess.run([path], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            log("%s: %s timed out" % (what, path))
+            return "failed: timeout"
+        except OSError as error:
+            log("%s: cannot run %s: %s" % (what, path, error))
+            return "failed: %s" % error
+        output = (proc.stdout or "").strip().splitlines()
+        outcome = output[-1].strip() if output else ""
+        if proc.returncode != 0:
+            log("%s: %s failed with exit code %d (%s)" % (what, path, proc.returncode, outcome))
+            return "failed: %s" % (outcome or "exit code %d" % proc.returncode)
+        log("%s: %s" % (what, outcome or "done"))
+        return outcome or "ok"
+
+    def watch_ownership(self):
+        """Notice a DND that somebody else turned off while we owned it."""
+        record = read_state()
+        if record.get("owned") != "yes":
+            return
+        if time.monotonic() - self.last_script_call < SCRIPT_GUARD_S:
+            return
+        manual = manual_dnd_state()
+        if manual == "off":
+            log("the DND was turned off while owned by this automation - releasing the ownership")
+            with StateLock():
+                write_state({"owned": "no"})
+        elif manual == "unknown":
+            log("cannot read the manual DND flag - keeping the ownership as is")
+
+    # -- periodic work -----------------------------------------------------
+
+    def on_poll(self):
+        try:
+            self.evaluate("poll")
+            self.watch_ownership()
+        except Exception as error:            # never let the poll kill us
+            log("poll failed: %r" % (error,))
+        return GLib.SOURCE_CONTINUE
+
+    # -- the D-Bus interface -----------------------------------------------
+
+    def on_method_call(self, _connection, _sender, _path, _interface, method,
+                       parameters, invocation):
+        try:
+            if method == "GetState":
+                record = read_state()
+                manual = manual_dnd_state()
+                composite = composite_dnd_state(self.connection)
+                ownership = "owned" if record.get("owned") == "yes" else "not-owned"
+                pre = record.get("pre") or "none"
+                session = self.session_state
+                app = "running" if self.app_running else "not-running"
+                invocation.return_value(GLib.Variant(
+                    "(sssssss)",
+                    (manual, composite, ownership, pre,
+                     "yes" if self.work_active else "no", session, app),
+                ))
+            elif method == "SetDnd":
+                desired = parameters.unpack()[0]
+                if desired:
+                    outcome = self.force_on()
+                else:
+                    outcome = self.run_script(SCRIPT_OFF, "restore")
+                invocation.return_value(GLib.Variant("(s)", (outcome,)))
+            else:
+                invocation.return_error_literal(
+                    Gio.DBusError, Gio.DBusError.UNKNOWN_METHOD,
+                    "unknown method %s" % method)
+        except GLib.Error as error:
+            invocation.return_gerror(error)
+        except Exception as error:            # pragma: no cover - defensive
+            log("method %s failed: %r" % (method, error))
+            invocation.return_error_literal(
+                Gio.DBusError, Gio.DBusError.FAILED, str(error))
+
+    def force_on(self):
+        """Enable the DND on explicit request, honouring the same rules."""
+        with StateLock():
+            record = read_state()
+            if not record.get("pre"):
+                manual = manual_dnd_state()
+                if manual == "unknown":
+                    return "failed: cannot read the manual DND flag"
+                fields = {"pre": "manual-on" if manual == "on" else "manual-off"}
+                if "owned" not in record:
+                    fields["owned"] = "no"
+                write_state(fields)
+        return self.run_script(SCRIPT_ON, "enable")
+
+
+def main():
+    service = FocusDndService()
+    try:
+        service.run()
+    except KeyboardInterrupt:
+        pass
+    except GLib.Error as error:
+        log("fatal: %s" % error.message)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

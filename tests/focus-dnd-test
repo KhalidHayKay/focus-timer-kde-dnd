@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+{
+    echo "=== $(date) ==="
+    echo "PATH=$PATH"
+    command -v qdbus6 || true
+    qdbus6 org.freedesktop.Notifications \
+      /org/freedesktop/Notifications \
+      org.freedesktop.Notifications.Inhibited 2>&1
+} >> "$HOME/focus-dnd-test.log" 2>&1

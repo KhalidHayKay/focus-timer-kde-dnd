@@ -1,0 +1,19 @@
+# Local state / logs / user config
+*.log
+owner
+lock
+focus-dnd.log
+
+# Backups
+*.bak
+*.bak-*
+
+# Editor / temp
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Test artifacts
+tests/work/
+tests/*/work/
