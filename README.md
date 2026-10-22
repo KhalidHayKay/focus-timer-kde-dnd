@@ -65,7 +65,7 @@ sudo pacman -S python python-gobject dbus python-dbus qt6-tools  # qdbus6 usuall
 ### Install
 
 ```bash
-git clone <your-repo-url> focus-timer-kde-dnd
+git clone https://github.com/KhalidHayKay/focus-timer-kde-dnd.git focus-timer-kde-dnd
 cd focus-timer-kde-dnd
 ./install.sh
 ```
@@ -116,15 +116,15 @@ The uninstaller stops/disables only this project's service, removes only files i
 
 ## Tests
 
-Regression tests are included in `tests/`:
-- `parser-regression.sh` — tolerant timestamp parser (unpadded seconds, fractions, edge cases)
-- `decision-tests.sh` — ownership rules, no-op behaviour, guards
-
-Run them in a shell (they use isolated scratch dirs and stubs):
-
+### Offline regression tests (safe, no desktop/DND changes)
 ```bash
-cd tests && bash parser-regression.sh && bash decision-tests.sh
+cd tests
+bash parser-regression.sh
+bash decision-tests.sh
 ```
+
+### Live integration tests (manual, opt-in only)
+See `tests/focus-dnd/README.md`. These interact with the live Focus Timer, Plasma DND, and the running service. They must preserve and restore state; do not run them during packaging.
 
 ## License
 
